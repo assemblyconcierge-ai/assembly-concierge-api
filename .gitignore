@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+*.db
+*.sqlite
+test_db.mjs
+test_db.ts
+debug_sig.ts

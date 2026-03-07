@@ -1,0 +1,123 @@
+Assembly Concierge - Backend Build Log
+=======================================
+Version : AC_Phase1_v6_2026-03-01
+Date    : 2026-03-01
+Tests   : 97 / 97 PASSING (3 suites)
+
+CHANGES FROM v5 TO v6
+======================
+
+1. STRIPE WEBHOOK SIGNATURE VERIFICATION  [COMPLETE]
+   File: src/lib/webhookSecurity.ts (rewritten)
+
+   Problem (v5): The webhook route checked the custom X-Webhook-Signature
+   header only, using a flat HMAC-SHA256 over the raw body.  Stripe sends
+   a stripe-signature header with the format:
+       t=<unix_timestamp>,v1=<hex_signature>
+   where the signed payload is "<timestamp>.<raw_body>".
+
+   Fix (v6):
+   - parseStripeSignatureHeader() parses the t= and v1= fields.
+   - verifyStripeSignature() reconstructs the signed payload, enforces a
+     300-second replay-window, and does a timing-safe compare.
+   - verifyInboundWebhook() is the unified entry point; tries
+     stripe-signature first (when STRIPE_WEBHOOK_SECRET is set), then
+     falls back to X-Webhook-Signature (Make.com forwarding path).
+   - Legacy helpers (signPayload, verifyWebhookSignature) preserved for
+     backward compatibility with existing tests.
+
+   New env var: STRIPE_WEBHOOK_SECRET (whsec_... from Stripe Dashboard)
+   Existing env var: WEBHOOK_SECRET (used for Make.com forwarding path)
+
+   Route change in src/app.ts:
+   - Reads both WEBHOOK_SECRET and STRIPE_WEBHOOK_SECRET at startup.
+   - Calls verifyInboundWebhook() instead of verifySignature() directly.
+   - Returns { error: 'INVALID_SIGNATURE', mode: 'stripe|generic|none' }
+     on 401 to aid debugging.
+
+2. POSTGRES / SQLITE DUAL-MODE DATABASE  [COMPLETE]
+   File: src/db/database.ts
+
+   Problem (v5): createDatabase() activated the Postgres path whenever
+   DATABASE_URL was set, regardless of the URL scheme.  The sandbox
+   environment has DATABASE_URL=mysql://... which caused pg-pool to
+   attempt a MySQL connection and throw AggregateError, breaking all
+   97 tests.
+
+   Fix (v6):
+   - Added isPostgres guard: Postgres path activates only when
+     DATABASE_URL starts with "postgres://" or "postgresql://".
+   - All other DATABASE_URL values (mysql://, sqlite://, etc.) silently
+     fall through to in-memory SQLite.
+   - No changes to the Postgres schema or adapter logic.
+
+   Production usage (unchanged): set DATABASE_URL=postgres://... to use
+   Postgres; omit or set to anything else to use in-memory SQLite.
+
+COMPLETE FEATURES (v6)
+=======================
+[x] POST /intake          - accepts real Jotform payload (q3_fullName, etc.)
+[x] POST /bookings        - creates booking with server-side pricing
+[x] POST /payments/intent - creates payment intent record
+[x] POST /webhooks/payment - verifies Stripe stripe-signature OR
+                              Make X-Webhook-Signature; updates job state
+[x] POST /webhooks/payment/replay - idempotent replay for Make.com retries
+[x] GET  /jobs/:jobCode   - returns job state for Airtable polling
+[x] POST /dispatch/offer  - contractor offer dispatch
+[x] POST /dispatch/respond - contractor accept/decline
+[x] Server-side pricing enforcement (SAME_DAY=$30, NEXT_DAY=$20)
+[x] Real Jotform field mapping (q3_fullName, q5_phoneNumber.full, etc.)
+[x] E.164 phone normalization
+[x] UUIDv7 job IDs, AC-XXXX-XXXX job codes
+[x] 11-state job state machine
+[x] Postgres (postgres://) + SQLite (fallback) dual-mode database
+[x] 97/97 automated tests passing
+
+INCOMPLETE / OUT OF SCOPE FOR v6
+==================================
+[ ] Permanent public URL - deploy to Render/Railway with DATABASE_URL
+    pointing to a managed Postgres instance (e.g. Render Postgres free tier).
+
+[ ] SMS sending - Option B: backend returns smsTemplate in /intake response;
+    Make.com reads it and sends via Twilio/Quo.  No code changes needed.
+
+[ ] Airtable write-back - Make.com reads job fields from /intake response
+    and writes to Airtable using the column names in Jobs-_SCHEMA_AUDIT CSV.
+
+ENV VARS REQUIRED IN PRODUCTION
+=================================
+DATABASE_URL           postgres://user:pass@host:5432/dbname
+WEBHOOK_SECRET         any strong random string (for Make.com path)
+STRIPE_WEBHOOK_SECRET  whsec_... (from Stripe Dashboard -> Webhooks)
+PORT                   (optional, defaults to 4001)
+
+QUICK START
+============
+  npm install
+  npm test          # 97/97 - uses in-memory SQLite, no DATABASE_URL needed
+  npm run build     # compiles TypeScript -> dist/
+  npm start         # starts server on PORT (default 4001)
+
+FILE STRUCTURE
+===============
+src/
+  app.ts                      Express app factory
+  db/
+    database.ts               Dual-mode DB (Postgres / SQLite)
+    bookingRepository.ts
+    jobRepository.ts
+    paymentRepository.ts
+    dispatchRepository.ts
+    webhookEventRepository.ts
+  domain/
+    identifiers.ts            UUIDv7 jobId, AC-XXXX-XXXX jobCode
+    pricing.ts                Server-side pricing engine
+    jotformNormalizer.ts      Jotform field key parser
+    stateMachine.ts           11-state job FSM
+  lib/
+    webhookSecurity.ts        Stripe + generic HMAC verification
+tests/
+  unit/domain.test.ts
+  integration/api.test.ts
+  integration/webhookReplay.test.ts
+  fixtures/helpers.ts
