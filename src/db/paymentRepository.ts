@@ -1,18 +1,61 @@
 // ============================================================
-// Assembly Concierge MVP v2 — Payment & Job Repository
+// Assembly Concierge MVP v3 — Payment & Job Repository
 //
-// Handles: payment intent creation, webhook processing,
-// job creation (with job_code), dispatch attempt management,
-// and webhook replay.
+// Postgres-aware + sql.js fallback
+//
+// Handles:
+// - payment intent creation
+// - webhook processing
+// - job creation (with job_code)
+// - dispatch attempt management
+// - webhook replay
 // ============================================================
 
 import type { Database } from 'sql.js';
-import { dbGet, dbRun, dbAll, dbChanges, now } from './database.js';
+import { dbGet, dbRun, dbAll, dbChanges, now, pgAdapter } from './database.js';
 import type { Job, Payment, DispatchAttempt, JobStatus } from '../domain/types.js';
 import { generateId, generatePublicJobCode } from '../domain/identifiers.js';
 import { verifyPaymentAmount } from '../domain/pricing.js';
 import { transitionJob } from '../domain/stateMachine.js';
 import { updateBookingStatus } from './bookingRepository.js';
+
+// ── Internal DB Helpers ──────────────────────────────────────
+
+async function run(db: Database, sql: string, params: any[] = []): Promise<void> {
+  if (pgAdapter) {
+    await pgAdapter.run(sql, params);
+    return;
+  }
+  dbRun(db, sql, params);
+}
+
+async function get<T>(db: Database, sql: string, params: any[] = []): Promise<T | undefined> {
+  if (pgAdapter) {
+    const row = await pgAdapter.queryOne(sql, params);
+    return (row ?? undefined) as T | undefined;
+  }
+  return dbGet<T>(db, sql, params);
+}
+
+async function all<T>(db: Database, sql: string, params: any[] = []): Promise<T[]> {
+  if (pgAdapter) {
+    const rows = await pgAdapter.query(sql, params);
+    return rows as T[];
+  }
+  return dbAll<T>(db, sql, params);
+}
+
+async function changesAfterUpdate(db: Database, sql: string, params: any[] = []): Promise<number> {
+  if (pgAdapter) {
+    const result = await pgAdapter.query(
+      `${sql} RETURNING 1`,
+      params,
+    );
+    return result.length;
+  }
+  dbRun(db, sql, params);
+  return dbChanges(db);
+}
 
 // ── Payment Intent ───────────────────────────────────────────
 
@@ -32,14 +75,16 @@ export interface CreatePaymentIntentResult {
   paymentEventId: string;
 }
 
-export function createPaymentIntent(
+export async function createPaymentIntent(
   db: Database,
   input: CreatePaymentIntentInput,
-): CreatePaymentIntentResult {
-  const existing = dbGet<any>(db,
+): Promise<CreatePaymentIntentResult> {
+  const existing = await get<any>(
+    db,
     `SELECT * FROM payments WHERE payment_event_id = ?`,
     [input.paymentEventId],
   );
+
   if (existing) {
     return {
       paymentId: existing.payment_id,
@@ -53,20 +98,39 @@ export function createPaymentIntent(
   const paymentId = generateId();
   const ts = now();
 
-  dbRun(db, `
+  await run(
+    db,
+    `
     INSERT INTO payments (
       payment_id, job_id, booking_id, customer_id, payment_type,
       amount, currency, status, payment_event_id, processor_ref,
       created_at, updated_at
     ) VALUES (?, NULL, ?, ?, ?, ?, 'USD', 'PENDING', ?, NULL, ?, ?)
-  `, [paymentId, input.bookingId, input.customerId, input.paymentType,
-      input.amount, input.paymentEventId, ts, ts]);
+    `,
+    [
+      paymentId,
+      input.bookingId,
+      input.customerId,
+      input.paymentType,
+      input.amount,
+      input.paymentEventId,
+      ts,
+      ts,
+    ],
+  );
 
-  // Advance booking to AWAITING_PAYMENT (from PRICED)
-  const bookingRow = dbGet<any>(db, `SELECT status FROM booking_requests WHERE booking_id = ?`, [input.bookingId]);
+  const bookingRow = await get<any>(
+    db,
+    `SELECT status FROM booking_requests WHERE booking_id = ?`,
+    [input.bookingId],
+  );
+
   if (bookingRow && bookingRow.status === 'PRICED') {
-    dbRun(db, `UPDATE booking_requests SET status = 'AWAITING_PAYMENT', updated_at = ? WHERE booking_id = ?`,
-      [ts, input.bookingId]);
+    await run(
+      db,
+      `UPDATE booking_requests SET status = 'AWAITING_PAYMENT', updated_at = ? WHERE booking_id = ?`,
+      [ts, input.bookingId],
+    );
   }
 
   return {
@@ -105,128 +169,236 @@ export interface ProcessWebhookResult {
   bookingId?: string;
 }
 
-export function processWebhook(
+export async function processWebhook(
   db: Database,
   payload: WebhookPayload,
   rawBody: string,
   signature: string,
-): ProcessWebhookResult {
-  // 1. Idempotency: check if already processed
-  const existingEvent = dbGet<any>(db,
+): Promise<ProcessWebhookResult> {
+  const existingEvent = await get<any>(
+    db,
     `SELECT * FROM webhook_events WHERE webhook_event_id = ?`,
     [payload.webhookEventId],
   );
+
   if (existingEvent?.processed_at) {
     return { outcome: 'DUPLICATE' };
   }
 
-  // 2. Record webhook event (before processing)
   if (!existingEvent) {
     const ts = now();
-    dbRun(db, `
+    await run(
+      db,
+      `
       INSERT INTO webhook_events (webhook_event_id, event_type, raw_body, signature, created_at)
       VALUES (?, ?, ?, ?, ?)
-    `, [payload.webhookEventId, payload.eventType, rawBody, signature, ts]);
+      `,
+      [payload.webhookEventId, payload.eventType, rawBody, signature, ts],
+    );
   }
 
-  // 3. Find payment record
-  const payment = dbGet<any>(db,
+  const payment = await get<any>(
+    db,
     `SELECT * FROM payments WHERE payment_event_id = ?`,
     [payload.paymentEventId],
   );
+
   if (!payment) {
     return { outcome: 'PAYMENT_NOT_FOUND' };
   }
 
   const bookingId = payment.booking_id;
 
-  // 4. Find booking
-  const booking = dbGet<any>(db,
+  const booking = await get<any>(
+    db,
     `SELECT * FROM booking_requests WHERE booking_id = ?`,
     [bookingId],
   );
+
   if (!booking) {
     return { outcome: 'BOOKING_NOT_FOUND' };
   }
 
-  // 5. Outside-area guard
   if (booking.area_status === 'OUTSIDE_AREA') {
     return { outcome: 'OUTSIDE_AREA' };
   }
 
-  // 6. Price verification (server-enforced)
-  const expectedAmount = payment.payment_type === 'DEPOSIT'
-    ? booking.deposit_amount
-    : booking.quoted_total;
+  const expectedAmount =
+    payment.payment_type === 'DEPOSIT'
+      ? booking.deposit_amount
+      : booking.quoted_total;
 
   const priceCheck = verifyPaymentAmount(expectedAmount, payload.amount);
+
   if (!priceCheck.ok) {
-    dbRun(db, `UPDATE webhook_events SET processed_at = ?, outcome = ? WHERE webhook_event_id = ?`,
-      [now(), 'PRICE_MISMATCH', payload.webhookEventId]);
+    await run(
+      db,
+      `UPDATE webhook_events SET processed_at = ?, outcome = ? WHERE webhook_event_id = ?`,
+      [now(), 'PRICE_MISMATCH', payload.webhookEventId],
+    );
     return { outcome: 'PRICE_MISMATCH' };
   }
 
-  // 7. Check if job already exists for this booking
-  const existingJob = dbGet<any>(db,
+  const existingJob = await get<any>(
+    db,
     `SELECT * FROM jobs WHERE booking_id = ?`,
     [bookingId],
   );
+
   if (existingJob) {
-    dbRun(db, `UPDATE payments SET job_id = ?, status = 'SUCCEEDED', updated_at = ? WHERE payment_id = ?`,
-      [existingJob.job_id, now(), payment.payment_id]);
-    dbRun(db, `UPDATE webhook_events SET processed_at = ?, outcome = ? WHERE webhook_event_id = ?`,
-      [now(), 'DUPLICATE', payload.webhookEventId]);
-    return { outcome: 'DUPLICATE', jobId: existingJob.job_id, jobCode: existingJob.job_code, bookingId };
+    await run(
+      db,
+      `UPDATE payments SET job_id = ?, status = 'SUCCEEDED', updated_at = ? WHERE payment_id = ?`,
+      [existingJob.job_id, now(), payment.payment_id],
+    );
+
+    await run(
+      db,
+      `UPDATE webhook_events SET processed_at = ?, outcome = ? WHERE webhook_event_id = ?`,
+      [now(), 'DUPLICATE', payload.webhookEventId],
+    );
+
+    return {
+      outcome: 'DUPLICATE',
+      jobId: existingJob.job_id,
+      jobCode: existingJob.job_code,
+      bookingId,
+    };
   }
 
-  // 8. Create job (exactly once, atomic via INSERT OR IGNORE)
   const jobId = generateId();
   let jobCode = generatePublicJobCode();
 
   let attempts = 0;
   while (attempts < 5) {
-    const collision = dbGet<any>(db, `SELECT job_id FROM jobs WHERE job_code = ?`, [jobCode]);
+    const collision = await get<any>(
+      db,
+      `SELECT job_id FROM jobs WHERE job_code = ?`,
+      [jobCode],
+    );
     if (!collision) break;
     jobCode = generatePublicJobCode();
     attempts++;
   }
 
-  const jobStatus: JobStatus = payment.payment_type === 'DEPOSIT' ? 'PAID_DEPOSIT' : 'PAID_FULL';
+  const jobStatus: JobStatus =
+    payment.payment_type === 'DEPOSIT' ? 'PAID_DEPOSIT' : 'PAID_FULL';
+
   const ts = now();
 
-  dbRun(db, `
-    INSERT OR IGNORE INTO jobs (
-      job_id, job_code, booking_id, customer_id, service_type, rush,
-      resolved_city, raw_address, price_version, quoted_total, deposit_amount,
-      payment_mode, status, assigned_contractor_id, dispatch_attempts,
-      created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, ?)
-  `, [
-    jobId, jobCode, bookingId, booking.customer_id,
-    booking.service_type, booking.rush,
-    booking.resolved_city ?? '', booking.raw_address,
-    booking.price_version, booking.quoted_total, booking.deposit_amount,
-    booking.payment_mode, jobStatus, ts, ts,
-  ]);
+  if (pgAdapter) {
+    const inserted = await pgAdapter.query(
+      `
+      INSERT INTO jobs (
+        job_id, job_code, booking_id, customer_id, service_type, rush,
+        resolved_city, raw_address, price_version, quoted_total, deposit_amount,
+        payment_mode, status, assigned_contractor_id, dispatch_attempts,
+        created_at, updated_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NULL, 0, $14, $15)
+      ON CONFLICT (booking_id) DO NOTHING
+      RETURNING job_id, job_code
+      `,
+      [
+        jobId,
+        jobCode,
+        bookingId,
+        booking.customer_id,
+        booking.service_type,
+        booking.rush,
+        booking.resolved_city ?? '',
+        booking.raw_address,
+        booking.price_version,
+        booking.quoted_total,
+        booking.deposit_amount,
+        booking.payment_mode,
+        jobStatus,
+        ts,
+        ts,
+      ],
+    );
 
-  const changes = dbChanges(db);
-  if (changes === 0) {
-    const raceJob = dbGet<any>(db, `SELECT * FROM jobs WHERE booking_id = ?`, [bookingId])!;
-    dbRun(db, `UPDATE webhook_events SET processed_at = ?, outcome = ? WHERE webhook_event_id = ?`,
-      [now(), 'DUPLICATE', payload.webhookEventId]);
-    return { outcome: 'DUPLICATE', jobId: raceJob.job_id, jobCode: raceJob.job_code, bookingId };
+    if (inserted.length === 0) {
+      const raceJob = await get<any>(
+        db,
+        `SELECT * FROM jobs WHERE booking_id = ?`,
+        [bookingId],
+      );
+
+      await run(
+        db,
+        `UPDATE webhook_events SET processed_at = ?, outcome = ? WHERE webhook_event_id = ?`,
+        [now(), 'DUPLICATE', payload.webhookEventId],
+      );
+
+      return {
+        outcome: 'DUPLICATE',
+        jobId: raceJob?.job_id,
+        jobCode: raceJob?.job_code,
+        bookingId,
+      };
+    }
+  } else {
+    dbRun(
+      db,
+      `
+      INSERT OR IGNORE INTO jobs (
+        job_id, job_code, booking_id, customer_id, service_type, rush,
+        resolved_city, raw_address, price_version, quoted_total, deposit_amount,
+        payment_mode, status, assigned_contractor_id, dispatch_attempts,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, ?)
+      `,
+      [
+        jobId,
+        jobCode,
+        bookingId,
+        booking.customer_id,
+        booking.service_type,
+        booking.rush,
+        booking.resolved_city ?? '',
+        booking.raw_address,
+        booking.price_version,
+        booking.quoted_total,
+        booking.deposit_amount,
+        booking.payment_mode,
+        jobStatus,
+        ts,
+        ts,
+      ],
+    );
+
+    const changes = dbChanges(db);
+    if (changes === 0) {
+      const raceJob = dbGet<any>(db, `SELECT * FROM jobs WHERE booking_id = ?`, [bookingId])!;
+
+      dbRun(
+        db,
+        `UPDATE webhook_events SET processed_at = ?, outcome = ? WHERE webhook_event_id = ?`,
+        [now(), 'DUPLICATE', payload.webhookEventId],
+      );
+
+      return {
+        outcome: 'DUPLICATE',
+        jobId: raceJob.job_id,
+        jobCode: raceJob.job_code,
+        bookingId,
+      };
+    }
   }
 
-  // 9. Link payment to job and mark succeeded
-  dbRun(db, `UPDATE payments SET job_id = ?, status = 'SUCCEEDED', updated_at = ? WHERE payment_id = ?`,
-    [jobId, now(), payment.payment_id]);
+  await run(
+    db,
+    `UPDATE payments SET job_id = ?, status = 'SUCCEEDED', updated_at = ? WHERE payment_id = ?`,
+    [jobId, now(), payment.payment_id],
+  );
 
-  // 10. Advance booking to CONVERTED
-  updateBookingStatus(db, bookingId, 'CONVERTED');
+  await updateBookingStatus(db, bookingId, 'CONVERTED');
 
-  // 11. Mark webhook as processed
-  dbRun(db, `UPDATE webhook_events SET processed_at = ?, outcome = ? WHERE webhook_event_id = ?`,
-    [now(), 'SUCCESS', payload.webhookEventId]);
+  await run(
+    db,
+    `UPDATE webhook_events SET processed_at = ?, outcome = ? WHERE webhook_event_id = ?`,
+    [now(), 'SUCCESS', payload.webhookEventId],
+  );
 
   return { outcome: 'SUCCESS', jobId, jobCode, bookingId };
 }
@@ -240,30 +412,48 @@ export interface ReplayWebhookResult {
   jobCode?: string;
 }
 
-export function replayWebhook(db: Database, webhookEventId: string): ReplayWebhookResult {
-  const event = dbGet<any>(db,
+export async function replayWebhook(
+  db: Database,
+  webhookEventId: string,
+): Promise<ReplayWebhookResult> {
+  const event = await get<any>(
+    db,
     `SELECT * FROM webhook_events WHERE webhook_event_id = ?`,
     [webhookEventId],
   );
+
   if (!event) return { replayed: false, outcome: 'NOT_FOUND' };
 
-  // If already processed, return DUPLICATE immediately (idempotent replay)
   if (event.processed_at) {
-    // Look up the job for this webhook if it exists
     let jobId: string | undefined;
     let jobCode: string | undefined;
+
     try {
       const body = JSON.parse(event.raw_body);
-      const payment = dbGet<any>(db, `SELECT * FROM payments WHERE payment_event_id = ?`, [body.paymentEventId]);
+      const payment = await get<any>(
+        db,
+        `SELECT * FROM payments WHERE payment_event_id = ?`,
+        [body.paymentEventId],
+      );
+
       if (payment?.job_id) {
-        const job = dbGet<any>(db, `SELECT job_id, job_code FROM jobs WHERE job_id = ?`, [payment.job_id]);
-        if (job) { jobId = job.job_id; jobCode = job.job_code; }
+        const job = await get<any>(
+          db,
+          `SELECT job_id, job_code FROM jobs WHERE job_id = ?`,
+          [payment.job_id],
+        );
+        if (job) {
+          jobId = job.job_id;
+          jobCode = job.job_code;
+        }
       }
-    } catch { /* ignore */ }
+    } catch {
+      // ignore malformed replay body
+    }
+
     return { replayed: true, outcome: 'DUPLICATE', jobId, jobCode };
   }
 
-  // Not yet processed — run it now
   let payload: WebhookPayload;
   try {
     const body = JSON.parse(event.raw_body);
@@ -279,35 +469,58 @@ export function replayWebhook(db: Database, webhookEventId: string): ReplayWebho
     return { replayed: false, outcome: 'NOT_FOUND' };
   }
 
-  const result = processWebhook(db, payload, event.raw_body, event.signature ?? '');
-  return { replayed: true, outcome: result.outcome, jobId: result.jobId, jobCode: result.jobCode };
+  const result = await processWebhook(db, payload, event.raw_body, event.signature ?? '');
+  return {
+    replayed: true,
+    outcome: result.outcome,
+    jobId: result.jobId,
+    jobCode: result.jobCode,
+  };
 }
 
 // ── Job Fetch ────────────────────────────────────────────────
 
-export function getJobByBookingId(db: Database, bookingId: string): Job | undefined {
-  const row = dbGet<any>(db, `SELECT * FROM jobs WHERE booking_id = ?`, [bookingId]);
+export async function getJobByBookingId(
+  db: Database,
+  bookingId: string,
+): Promise<Job | undefined> {
+  const row = await get<any>(db, `SELECT * FROM jobs WHERE booking_id = ?`, [bookingId]);
   return row ? normalizeJob(row) : undefined;
 }
 
-export function getJobById(db: Database, jobId: string): Job | undefined {
-  const row = dbGet<any>(db, `SELECT * FROM jobs WHERE job_id = ?`, [jobId]);
+export async function getJobById(
+  db: Database,
+  jobId: string,
+): Promise<Job | undefined> {
+  const row = await get<any>(db, `SELECT * FROM jobs WHERE job_id = ?`, [jobId]);
   return row ? normalizeJob(row) : undefined;
 }
 
-export function getJobByCode(db: Database, jobCode: string): Job | undefined {
-  const row = dbGet<any>(db, `SELECT * FROM jobs WHERE job_code = ?`, [jobCode]);
+export async function getJobByCode(
+  db: Database,
+  jobCode: string,
+): Promise<Job | undefined> {
+  const row = await get<any>(db, `SELECT * FROM jobs WHERE job_code = ?`, [jobCode]);
   return row ? normalizeJob(row) : undefined;
 }
 
 // ── Job Status Update ────────────────────────────────────────
 
-export function updateJobStatus(db: Database, jobId: string, newStatus: JobStatus): void {
-  const row = dbGet<any>(db, `SELECT status FROM jobs WHERE job_id = ?`, [jobId]);
+export async function updateJobStatus(
+  db: Database,
+  jobId: string,
+  newStatus: JobStatus,
+): Promise<void> {
+  const row = await get<any>(db, `SELECT status FROM jobs WHERE job_id = ?`, [jobId]);
   if (!row) throw new Error(`Job not found: ${jobId}`);
+
   transitionJob(row.status as JobStatus, newStatus);
-  dbRun(db, `UPDATE jobs SET status = ?, updated_at = ? WHERE job_id = ?`,
-    [newStatus, now(), jobId]);
+
+  await run(
+    db,
+    `UPDATE jobs SET status = ?, updated_at = ? WHERE job_id = ?`,
+    [newStatus, now(), jobId],
+  );
 }
 
 // ── Dispatch Engine ──────────────────────────────────────────
@@ -318,36 +531,57 @@ export interface OfferDispatchInput {
   timeoutMinutes?: number;
 }
 
-export function offerDispatch(db: Database, input: OfferDispatchInput): DispatchAttempt {
-  const job = dbGet<any>(db, `SELECT * FROM jobs WHERE job_id = ?`, [input.jobId]);
+export async function offerDispatch(
+  db: Database,
+  input: OfferDispatchInput,
+): Promise<DispatchAttempt> {
+  const job = await get<any>(db, `SELECT * FROM jobs WHERE job_id = ?`, [input.jobId]);
   if (!job) throw new Error(`Job not found: ${input.jobId}`);
 
-  const attemptNumber = job.dispatch_attempts + 1;
+  const attemptNumber = (job.dispatch_attempts ?? 0) + 1;
   const attemptId = generateId();
   const ts = now();
   const timeoutMs = (input.timeoutMinutes ?? 15) * 60 * 1000;
   const expiresAt = new Date(Date.now() + timeoutMs).toISOString();
 
-  dbRun(db, `
+  await run(
+    db,
+    `
     INSERT INTO dispatch_attempts (
       attempt_id, job_id, contractor_id, attempt_number,
       offered_at, expires_at, response, responded_at, created_at
     ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?)
-  `, [attemptId, input.jobId, input.contractorId, attemptNumber, ts, expiresAt, ts]);
+    `,
+    [attemptId, input.jobId, input.contractorId, attemptNumber, ts, expiresAt, ts],
+  );
 
   const currentStatus = job.status as JobStatus;
+
   if (currentStatus !== 'DISPATCHING') {
     transitionJob(currentStatus, 'DISPATCHING');
-    dbRun(db, `UPDATE jobs SET status = 'DISPATCHING', dispatch_attempts = ?, updated_at = ? WHERE job_id = ?`,
-      [attemptNumber, now(), input.jobId]);
+    await run(
+      db,
+      `UPDATE jobs SET status = 'DISPATCHING', dispatch_attempts = ?, updated_at = ? WHERE job_id = ?`,
+      [attemptNumber, now(), input.jobId],
+    );
   } else {
-    dbRun(db, `UPDATE jobs SET dispatch_attempts = ?, updated_at = ? WHERE job_id = ?`,
-      [attemptNumber, now(), input.jobId]);
+    await run(
+      db,
+      `UPDATE jobs SET dispatch_attempts = ?, updated_at = ? WHERE job_id = ?`,
+      [attemptNumber, now(), input.jobId],
+    );
   }
 
   return {
-    attemptId, jobId: input.jobId, contractorId: input.contractorId,
-    attemptNumber, offeredAt: ts, expiresAt, response: null, respondedAt: null, createdAt: ts,
+    attemptId,
+    jobId: input.jobId,
+    contractorId: input.contractorId,
+    attemptNumber,
+    offeredAt: ts,
+    expiresAt,
+    response: null,
+    respondedAt: null,
+    createdAt: ts,
   };
 }
 
@@ -356,62 +590,93 @@ export interface RespondDispatchResult {
   jobCode?: string;
 }
 
-export function respondDispatch(
+export async function respondDispatch(
   db: Database,
   input: { attemptId: string; response: 'ACCEPTED' | 'DECLINED' },
-): RespondDispatchResult {
-  const attempt = dbGet<any>(db,
+): Promise<RespondDispatchResult> {
+  const attempt = await get<any>(
+    db,
     `SELECT * FROM dispatch_attempts WHERE attempt_id = ?`,
     [input.attemptId],
   );
+
   if (!attempt) return { outcome: 'NOT_FOUND' };
+
   if (attempt.response !== null) {
     return { outcome: attempt.response === 'ACCEPTED' ? 'ASSIGNED' : 'DECLINED' };
   }
 
-  const job = dbGet<any>(db, `SELECT * FROM jobs WHERE job_id = ?`, [attempt.job_id]);
+  const job = await get<any>(db, `SELECT * FROM jobs WHERE job_id = ?`, [attempt.job_id]);
   if (!job) return { outcome: 'NOT_FOUND' };
 
   const ts = now();
 
   if (input.response === 'ACCEPTED') {
-    dbRun(db, `
-      UPDATE jobs SET status = 'ASSIGNED', assigned_contractor_id = ?, updated_at = ?
+    const changed = await changesAfterUpdate(
+      db,
+      `
+      UPDATE jobs
+      SET status = 'ASSIGNED', assigned_contractor_id = ?, updated_at = ?
       WHERE job_id = ? AND status = 'DISPATCHING'
-    `, [attempt.contractor_id, ts, attempt.job_id]);
+      `,
+      [attempt.contractor_id, ts, attempt.job_id],
+    );
 
-    const changes = dbChanges(db);
-    if (changes === 0) {
-      dbRun(db, `UPDATE dispatch_attempts SET response = 'DECLINED', responded_at = ? WHERE attempt_id = ?`,
-        [ts, input.attemptId]);
+    if (changed === 0) {
+      await run(
+        db,
+        `UPDATE dispatch_attempts SET response = 'DECLINED', responded_at = ? WHERE attempt_id = ?`,
+        [ts, input.attemptId],
+      );
       return { outcome: 'ALREADY_ASSIGNED' };
     }
 
-    dbRun(db, `UPDATE dispatch_attempts SET response = 'ACCEPTED', responded_at = ? WHERE attempt_id = ?`,
-      [ts, input.attemptId]);
+    await run(
+      db,
+      `UPDATE dispatch_attempts SET response = 'ACCEPTED', responded_at = ? WHERE attempt_id = ?`,
+      [ts, input.attemptId],
+    );
+
     return { outcome: 'ASSIGNED', jobCode: job.job_code };
-  } else {
-    dbRun(db, `UPDATE dispatch_attempts SET response = 'DECLINED', responded_at = ? WHERE attempt_id = ?`,
-      [ts, input.attemptId]);
-
-    if (job.dispatch_attempts >= 5) {
-      dbRun(db, `UPDATE jobs SET status = 'DISPATCH_FAILED', updated_at = ? WHERE job_id = ?`,
-        [ts, attempt.job_id]);
-    }
-
-    return { outcome: 'DECLINED' };
   }
+
+  await run(
+    db,
+    `UPDATE dispatch_attempts SET response = 'DECLINED', responded_at = ? WHERE attempt_id = ?`,
+    [ts, input.attemptId],
+  );
+
+  if ((job.dispatch_attempts ?? 0) >= 5) {
+    await run(
+      db,
+      `UPDATE jobs SET status = 'DISPATCH_FAILED', updated_at = ? WHERE job_id = ?`,
+      [ts, attempt.job_id],
+    );
+  }
+
+  return { outcome: 'DECLINED' };
 }
 
-export function getDispatchAttempts(db: Database, jobId: string): DispatchAttempt[] {
-  const rows = dbAll<any>(db,
+export async function getDispatchAttempts(
+  db: Database,
+  jobId: string,
+): Promise<DispatchAttempt[]> {
+  const rows = await all<any>(
+    db,
     `SELECT * FROM dispatch_attempts WHERE job_id = ? ORDER BY attempt_number ASC`,
     [jobId],
   );
-  return rows.map(r => ({
-    attemptId: r.attempt_id, jobId: r.job_id, contractorId: r.contractor_id,
-    attemptNumber: r.attempt_number, offeredAt: r.offered_at, expiresAt: r.expires_at,
-    response: r.response ?? null, respondedAt: r.responded_at ?? null, createdAt: r.created_at,
+
+  return rows.map((r) => ({
+    attemptId: r.attempt_id,
+    jobId: r.job_id,
+    contractorId: r.contractor_id,
+    attemptNumber: r.attempt_number,
+    offeredAt: r.offered_at,
+    expiresAt: r.expires_at,
+    response: r.response ?? null,
+    respondedAt: r.responded_at ?? null,
+    createdAt: r.created_at,
   }));
 }
 
